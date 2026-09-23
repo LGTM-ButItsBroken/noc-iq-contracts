@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SLACalculatorClient } from "../src/client";
-import { CANONICAL_SEVERITIES } from "../src/types";
+import { CANONICAL_SEVERITIES, decodeContractError } from "../src/types";
 
 describe("SLACalculatorClient", () => {
   const client = new SLACalculatorClient({
@@ -134,5 +134,94 @@ describe("SLACalculatorClient", () => {
         "low",
       ]);
     });
+  });
+
+  describe("getBatchSlaMetrics", () => {
+    it("returns a map keyed by site ID", async () => {
+      const result = await client.getBatchSlaMetrics([
+        "site-1",
+        "site-2",
+        "site-3",
+      ]);
+      expect(result.ok).toBe(true);
+      expect(result.value).toBeInstanceOf(Map);
+      expect(Array.from(result.value!.keys())).toEqual([
+        "site-1",
+        "site-2",
+        "site-3",
+      ]);
+    });
+
+    it("returns an empty map for an empty input", async () => {
+      const result = await client.getBatchSlaMetrics([]);
+      expect(result.ok).toBe(true);
+      expect(result.value!.size).toBe(0);
+    });
+  });
+
+  describe("buildOutageReportTx", () => {
+    it("returns a non-empty base64 envelope with defaults applied", () => {
+      const envelope = client.buildOutageReportTx({
+        source: "GABC1234567890",
+        outageId: "outage-001",
+        severity: "high",
+        mttrMinutes: 45,
+      });
+      expect(envelope.envelopeXdr.length).toBeGreaterThan(0);
+      expect(envelope.fee).toBe(100_000);
+      expect(envelope.sequence).toBe("0");
+    });
+
+    it("honours custom fee and sequence overrides", () => {
+      const envelope = client.buildOutageReportTx({
+        source: "GABC1234567890",
+        outageId: "outage-002",
+        severity: "critical",
+        mttrMinutes: 10,
+        fee: 250_000,
+        sequence: "42",
+      });
+      expect(envelope.fee).toBe(250_000);
+      expect(envelope.sequence).toBe("42");
+    });
+
+    it("produces different envelopes for different outage IDs", () => {
+      const a = client.buildOutageReportTx({
+        source: "GABC1234567890",
+        outageId: "outage-a",
+        severity: "low",
+        mttrMinutes: 5,
+      });
+      const b = client.buildOutageReportTx({
+        source: "GABC1234567890",
+        outageId: "outage-b",
+        severity: "low",
+        mttrMinutes: 5,
+      });
+      expect(a.envelopeXdr).not.toBe(b.envelopeXdr);
+    });
+  });
+});
+
+describe("decodeContractError", () => {
+  it("maps known contract error codes to descriptive messages", () => {
+    const decoded = decodeContractError(4);
+    expect(decoded.name).toBe("ConfigNotFound");
+    expect(decoded.message.length).toBeGreaterThan(0);
+    expect(decoded.recommendedAction.length).toBeGreaterThan(0);
+  });
+
+  it("maps Unauthorized (#3)", () => {
+    expect(decodeContractError(3).name).toBe("Unauthorized");
+  });
+
+  it("treats negative codes as Soroban host errors", () => {
+    const decoded = decodeContractError(-32603);
+    expect(decoded.name).toBe("HostError");
+  });
+
+  it("falls back to UnknownError for unrecognised positive codes", () => {
+    const decoded = decodeContractError(9999);
+    expect(decoded.name).toBe("UnknownError");
   });
 });
