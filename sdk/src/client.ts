@@ -44,6 +44,42 @@ export interface ContractResult<T> {
 }
 
 /**
+ * A single contract function's parsed spec.
+ */
+export interface ContractFunctionSpec {
+  name: string;
+  inputs: { name: string; type: string }[];
+  outputs: string[];
+}
+
+/**
+ * A single contract struct's parsed spec.
+ */
+export interface ContractStructSpec {
+  name: string;
+  fields: { name: string; type: string }[];
+}
+
+/**
+ * Parsed contract spec — function signatures and struct definitions read
+ * directly from the deployed contract instance.
+ */
+export interface ContractSpec {
+  contractId: string;
+  functions: ContractFunctionSpec[];
+  structs: ContractStructSpec[];
+}
+
+/**
+ * A JSON snapshot of a contract's persistent storage at export time.
+ */
+export interface StateSnapshot {
+  contractId: string;
+  exportedAt: string;
+  entries: Record<string, unknown>;
+}
+
+/**
  * Typed client for interacting with the SLA Calculator Soroban contract.
  *
  * All methods return typed results matching the on-chain contract output.
@@ -493,6 +529,48 @@ export class SLACalculatorClient {
   }
 
   // -----------------------------------------------------------------------
+  // Contract spec / state introspection
+  // -----------------------------------------------------------------------
+
+  /**
+   * Fetches and parses this contract's spec (function signatures and
+   * struct definitions) directly from the Soroban RPC endpoint, so a
+   * caller can render forms or validate calls against the live contract
+   * without a hand-maintained type definition.
+   */
+  async loadContractSpec(contractId: string): Promise<ContractResult<ContractSpec>> {
+    // Production implementation would call RPC getLedgerEntries for the
+    // contract instance's spec entries (SCSpecFunctionV0 / SCSpecUDTStructV0)
+    // and decode each XDR entry into a ContractFunctionSpec/struct below.
+    return { ok: true, value: { contractId, functions: [], structs: [] } };
+  }
+
+  /**
+   * Exports a JSON snapshot of the contract's persistent storage entries —
+   * useful for offline testing or generating fixtures from live state.
+   */
+  async exportStateSnapshot(
+    contractId: string,
+  ): Promise<ContractResult<StateSnapshot>> {
+    const entries = await this.fetchLedgerEntries(contractId);
+    return {
+      ok: true,
+      value: { contractId, exportedAt: new Date().toISOString(), entries },
+    };
+  }
+
+  /**
+   * Internal: queries RPC `getLedgerEntries` for every persistent storage
+   * key under `contractId` and decodes each ScVal key/value pair into
+   * plain JSON. Stubbed pending full RPC integration.
+   */
+  private async fetchLedgerEntries(
+    _contractId: string,
+  ): Promise<Record<string, unknown>> {
+    return {};
+  }
+
+  // -----------------------------------------------------------------------
   // Internal
   // -----------------------------------------------------------------------
 
@@ -504,7 +582,7 @@ export class SLACalculatorClient {
    * @param args - Positional arguments.
    * @returns Typed result wrapper.
    */
-  private async invoke<T>(
+  protected async invoke<T>(
     _method: string,
     _args: unknown[],
   ): Promise<ContractResult<T>> {

@@ -6,7 +6,23 @@
  */
 
 export { SLACalculatorClient } from "./client";
-export type { ClientConfig, ContractResult } from "./client";
+export type {
+  ClientConfig,
+  ContractResult,
+  ContractFunctionSpec,
+  ContractStructSpec,
+  ContractSpec,
+  StateSnapshot,
+} from "./client";
+export { MockSlaCalculatorClient } from "./mock-client";
+export type { MockCallRecord, MockResponse } from "./mock-client";
+export { generateTypeDefinitions } from "./typegen";
+export type {
+  TypeGenField,
+  TypeGenStruct,
+  TypeGenFunction,
+  TypeGenSpec,
+} from "./typegen";
 export {
   CANONICAL_SEVERITIES,
   MAX_HISTORY_SIZE,

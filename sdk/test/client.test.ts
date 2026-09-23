@@ -135,4 +135,30 @@ describe("SLACalculatorClient", () => {
       ]);
     });
   });
+
+  describe("loadContractSpec", () => {
+    it("returns a spec keyed to the requested contract ID", async () => {
+      const result = await client.loadContractSpec("CABC1234567890ABCDEF");
+      expect(result.ok).toBe(true);
+      expect(result.value?.contractId).toBe("CABC1234567890ABCDEF");
+      expect(Array.isArray(result.value?.functions)).toBe(true);
+      expect(Array.isArray(result.value?.structs)).toBe(true);
+    });
+  });
+
+  describe("exportStateSnapshot", () => {
+    it("returns a snapshot with contractId, timestamp, and entries", async () => {
+      const result = await client.exportStateSnapshot("CABC1234567890ABCDEF");
+      expect(result.ok).toBe(true);
+      expect(result.value?.contractId).toBe("CABC1234567890ABCDEF");
+      expect(typeof result.value?.exportedAt).toBe("string");
+      expect(result.value?.entries).toEqual({});
+    });
+
+    it("uses a fresh, valid ISO timestamp per export", async () => {
+      const result = await client.exportStateSnapshot("CABC1234567890ABCDEF");
+      const parsed = new Date(result.value!.exportedAt);
+      expect(Number.isNaN(parsed.getTime())).toBe(false);
+    });
+  });
 });
