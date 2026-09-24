@@ -20,6 +20,7 @@ export type { ScVal, ScValType } from "./scval";
 export {
   CANONICAL_SEVERITIES,
   MAX_HISTORY_SIZE,
+  decodeContractError,
 } from "./types";
 export type {
   SLAConfig,
@@ -35,4 +36,5 @@ export type {
   FailureSchema,
   VersionInfo,
   Severity,
+  DecodedContractError,
 } from "./types";

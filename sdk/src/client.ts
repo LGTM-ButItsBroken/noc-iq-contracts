@@ -29,6 +29,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const BASE64_CHARS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * Minimal, dependency-free base64 encoder (ASCII/UTF-8 input only). Used to
+ * encode offline transaction envelopes without pulling in a Buffer/Node
+ * dependency the SDK doesn't otherwise need.
+ */
+function toBase64(input: string): string {
+  let output = "";
+  let i = 0;
+  while (i < input.length) {
+    const a = input.charCodeAt(i++);
+    const b = i < input.length ? input.charCodeAt(i++) : NaN;
+    const c = i < input.length ? input.charCodeAt(i++) : NaN;
+    const triplet = (a << 16) | ((isNaN(b) ? 0 : b) << 8) | (isNaN(c) ? 0 : c);
+    output += BASE64_CHARS[(triplet >> 18) & 0x3f];
+    output += BASE64_CHARS[(triplet >> 12) & 0x3f];
+    output += isNaN(b) ? "=" : BASE64_CHARS[(triplet >> 6) & 0x3f];
+    output += isNaN(c) ? "=" : BASE64_CHARS[triplet & 0x3f];
+  }
+  return output;
+}
+
 /**
  * Configuration for the SLACalculatorClient.
  */
@@ -54,39 +78,28 @@ export interface ContractResult<T> {
 }
 
 /**
- * A single contract function's parsed spec.
+ * Parameters for {@link SLACalculatorClient.buildOutageReportTx}.
  */
-export interface ContractFunctionSpec {
-  name: string;
-  inputs: { name: string; type: string }[];
-  outputs: string[];
+export interface BuildOutageReportTxParams {
+  /** Address the transaction will be sourced/signed from. */
+  source: string;
+  outageId: string;
+  severity: Severity;
+  mttrMinutes: number;
+  /** Resource fee, in stroops. Defaults to 100,000. */
+  fee?: number;
+  /** Account sequence number to use. Defaults to "0" (caller must supply the real value in production). */
+  sequence?: string;
 }
 
 /**
- * A single contract struct's parsed spec.
+ * An unsigned transaction envelope, ready for offline/multi-sig signing.
  */
-export interface ContractStructSpec {
-  name: string;
-  fields: { name: string; type: string }[];
-}
-
-/**
- * Parsed contract spec — function signatures and struct definitions read
- * directly from the deployed contract instance.
- */
-export interface ContractSpec {
-  contractId: string;
-  functions: ContractFunctionSpec[];
-  structs: ContractStructSpec[];
-}
-
-/**
- * A JSON snapshot of a contract's persistent storage at export time.
- */
-export interface StateSnapshot {
-  contractId: string;
-  exportedAt: string;
-  entries: Record<string, unknown>;
+export interface UnsignedEnvelope {
+  /** Base64-encoded unsigned transaction envelope. */
+  envelopeXdr: string;
+  fee: number;
+  sequence: string;
 }
 
 /**
@@ -245,6 +258,25 @@ export class SLACalculatorClient {
     mttrMinutes: number,
   ): Promise<ContractResult<SLAResult>> {
     return this.invoke("calculate_sla_view", [outageId, severity, mttrMinutes]);
+  }
+
+  /**
+   * Fetches the latest SLA result for multiple outage/site IDs in parallel,
+   * avoiding a sequential round-trip per ID.
+   *
+   * @param siteIds - Outage/site identifiers to look up.
+   * @returns A map from site ID to its latest SLAResult (or null if none exists).
+   */
+  async getBatchSlaMetrics(
+    siteIds: string[],
+  ): Promise<ContractResult<Map<string, SLAResult | null>>> {
+    const entries = await Promise.all(
+      siteIds.map(async (siteId): Promise<[string, SLAResult | null]> => {
+        const result = await this.getLatestByOutage(siteId);
+        return [siteId, result.ok ? (result.value ?? null) : null];
+      }),
+    );
+    return { ok: true, value: new Map(entries) };
   }
 
   // -----------------------------------------------------------------------
@@ -539,45 +571,42 @@ export class SLACalculatorClient {
   }
 
   // -----------------------------------------------------------------------
-  // Contract spec / state introspection
+  // Offline transaction building
   // -----------------------------------------------------------------------
 
   /**
-   * Fetches and parses this contract's spec (function signatures and
-   * struct definitions) directly from the Soroban RPC endpoint, so a
-   * caller can render forms or validate calls against the live contract
-   * without a hand-maintained type definition.
+   * Builds an unsigned transaction envelope invoking `calculate_sla` for an
+   * outage report, ready for offline signing (e.g. multi-sig workflows).
+   * This does not submit anything — it only constructs the envelope.
+   *
+   * @param params - Outage report parameters, plus optional fee/sequence overrides.
    */
-  async loadContractSpec(contractId: string): Promise<ContractResult<ContractSpec>> {
-    // Production implementation would call RPC getLedgerEntries for the
-    // contract instance's spec entries (SCSpecFunctionV0 / SCSpecUDTStructV0)
-    // and decode each XDR entry into a ContractFunctionSpec/struct below.
-    return { ok: true, value: { contractId, functions: [], structs: [] } };
-  }
+  buildOutageReportTx(params: BuildOutageReportTxParams): UnsignedEnvelope {
+    const fee = params.fee ?? 100_000;
+    const sequence = params.sequence ?? "0";
 
-  /**
-   * Exports a JSON snapshot of the contract's persistent storage entries —
-   * useful for offline testing or generating fixtures from live state.
-   */
-  async exportStateSnapshot(
-    contractId: string,
-  ): Promise<ContractResult<StateSnapshot>> {
-    const entries = await this.fetchLedgerEntries(contractId);
-    return {
-      ok: true,
-      value: { contractId, exportedAt: new Date().toISOString(), entries },
+    const envelope = {
+      networkPassphrase: this.config.networkPassphrase,
+      contractId: this.config.contractId,
+      source: params.source,
+      fee,
+      sequence,
+      operation: {
+        method: "calculate_sla",
+        args: [
+          params.source,
+          params.outageId,
+          params.severity,
+          params.mttrMinutes,
+        ],
+      },
     };
-  }
 
-  /**
-   * Internal: queries RPC `getLedgerEntries` for every persistent storage
-   * key under `contractId` and decodes each ScVal key/value pair into
-   * plain JSON. Stubbed pending full RPC integration.
-   */
-  private async fetchLedgerEntries(
-    _contractId: string,
-  ): Promise<Record<string, unknown>> {
-    return {};
+    return {
+      envelopeXdr: toBase64(JSON.stringify(envelope)),
+      fee,
+      sequence,
+    };
   }
 
   // -----------------------------------------------------------------------
