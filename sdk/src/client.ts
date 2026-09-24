@@ -18,6 +18,16 @@ import {
   VersionInfo,
   Severity,
 } from "./types";
+import { ScVal, toScVal, fromScVal } from "./scval";
+
+// The project's tsconfig targets ES2020 with no DOM/Node lib, so the
+// ambient `setTimeout` global isn't declared even though it exists at
+// runtime in both browsers and Node. Declare just enough of its shape.
+declare function setTimeout(callback: () => void, ms: number): unknown;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Configuration for the SLACalculatorClient.
@@ -506,16 +516,226 @@ export class SLACalculatorClient {
    */
   private async invoke<T>(
     _method: string,
-    _args: unknown[],
+    args: unknown[],
   ): Promise<ContractResult<T>> {
+    // Convert typed JS/TS arguments into ScVal-shaped structures — this is
+    // what a real invocation would pass to `contract.call(method, ...)`.
+    const _scArgs: ScVal[] = args.map(toScVal);
+
     // Production implementation would use @stellar/stellar-sdk:
     //   const contract = new Contract(this.config.contractId);
     //   const tx = new TransactionBuilder(account)
-    //     .addOperation(contract.call(method, ...args))
+    //     .addOperation(contract.call(method, ..._scArgs))
     //     .build();
-    // ... sign, simulate, etc.
+    // ... sign, simulate, and decode the result via fromScVal().
     //
     // For now return a placeholder that demonstrates the typed interface.
     return { ok: true, value: undefined as T };
+  }
+
+  // -----------------------------------------------------------------------
+  // Pre-flight simulation
+  // -----------------------------------------------------------------------
+
+  /**
+   * Runs an RPC `simulateTransaction` pre-flight check for a contract
+   * method invocation before prompting the user for a signature, so an
+   * invalid call fails fast with a readable error instead of failing
+   * on-chain after the wallet has already charged a signing fee.
+   *
+   * @param method - Contract method name to simulate.
+   * @param args - Positional arguments (converted to ScVal internally).
+   */
+  async preflightInvoke(
+    method: string,
+    args: unknown[],
+  ): Promise<PreflightResult> {
+    const simulation = await this.simulateTransaction(method, args);
+    if (!simulation.success) {
+      return {
+        success: false,
+        error: simulation.error ?? "Simulation failed",
+        recommendedFee: 0n,
+      };
+    }
+    return { success: true, recommendedFee: simulation.minResourceFee };
+  }
+
+  /**
+   * Internal: calls the RPC `simulateTransaction` endpoint and parses the
+   * response into a success flag, human-readable error, and the minimum
+   * resource fee to use for the real transaction envelope. Stubbed pending
+   * full transaction-building integration.
+   */
+  private async simulateTransaction(
+    _method: string,
+    _args: unknown[],
+  ): Promise<{ success: boolean; error?: string; minResourceFee: bigint }> {
+    // Production implementation would POST a `simulateTransaction` JSON-RPC
+    // request built from a real transaction envelope to `this.config.rpcUrl`,
+    // then parse `result.error` / `result.minResourceFee` from the response.
+    return { success: true, minResourceFee: 100_000n };
+  }
+
+  // -----------------------------------------------------------------------
+  // Contract event subscription
+  // -----------------------------------------------------------------------
+
+  /**
+   * Subscribes to contract events matching `eventType`, polling the RPC
+   * `getEvents` endpoint and invoking `callback` for each new matching
+   * event as it's decoded into a typed object.
+   *
+   * @param eventType - Event topic/type to filter for.
+   * @param callback - Invoked once per new matching event.
+   * @param pollIntervalMs - Delay between polls, in milliseconds.
+   * @returns An unsubscribe function that stops polling.
+   */
+  onContractEvent<T = unknown>(
+    eventType: string,
+    callback: ContractEventCallback<T>,
+    pollIntervalMs = 5000,
+  ): () => void {
+    let cancelled = false;
+    let lastLedger = 0;
+
+    const poll = async () => {
+      if (cancelled) return;
+      const events = await this.getEvents(eventType, lastLedger);
+      for (const event of events) {
+        lastLedger = Math.max(lastLedger, event.ledger);
+        callback(event as ContractEvent<T>);
+      }
+      if (!cancelled) {
+        setTimeout(poll, pollIntervalMs);
+      }
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+    };
+  }
+
+  /**
+   * Internal: fetches raw events since `sinceLedger` via RPC `getEvents`
+   * and decodes each one's topic/data XDR into a typed `ContractEvent`.
+   * Stubbed pending full RPC integration.
+   */
+  private async getEvents(
+    _eventType: string,
+    _sinceLedger: number,
+  ): Promise<ContractEvent[]> {
+    return [];
+  }
+
+  // -----------------------------------------------------------------------
+  // Transaction confirmation polling
+  // -----------------------------------------------------------------------
+
+  /**
+   * Polls RPC `getTransaction` until the transaction reaches a terminal
+   * status (SUCCESS or FAILED), applying exponential backoff between polls
+   * (1s, 2s, 4s, 8s, ...capped so the overall wait never exceeds `timeoutMs`).
+   * Throws {@link TimeoutError} if no terminal status is reached in time.
+   *
+   * @param txHash - Hash of the submitted transaction to wait on.
+   * @param timeoutMs - Overall timeout, in milliseconds. Defaults to 60s.
+   */
+  async waitForTransactionConfirmation(
+    txHash: string,
+    timeoutMs = 60_000,
+  ): Promise<TransactionStatusResult> {
+    const start = Date.now();
+    let delayMs = 1000;
+
+    for (;;) {
+      const result = await this.getTransactionStatus(txHash);
+      if (result.status === "SUCCESS" || result.status === "FAILED") {
+        return result;
+      }
+
+      const elapsed = Date.now() - start;
+      if (elapsed >= timeoutMs) {
+        throw new TimeoutError(txHash);
+      }
+
+      await sleep(Math.min(delayMs, timeoutMs - elapsed));
+      delayMs *= 2;
+    }
+  }
+
+  /**
+   * Internal: calls the RPC `getTransaction` endpoint for `txHash`.
+   * Stubbed pending full RPC integration — subclasses may override this
+   * for testing.
+   */
+  protected async getTransactionStatus(
+    txHash: string,
+  ): Promise<TransactionStatusResult> {
+    return { status: "NOT_FOUND", txHash };
+  }
+}
+
+/**
+ * Result of a pre-flight `simulateTransaction` check.
+ */
+export interface PreflightResult {
+  /** Whether the simulated invocation would succeed. */
+  success: boolean;
+  /** Human-readable error message, present when success is false. */
+  error?: string;
+  /** Recommended resource fee (stroops) for the transaction envelope. */
+  recommendedFee: bigint;
+}
+
+/**
+ * A decoded contract event.
+ */
+export interface ContractEvent<T = unknown> {
+  /** Event topic/type. */
+  type: string;
+  /** Ledger sequence the event was emitted in. */
+  ledger: number;
+  /** Decoded event data. */
+  data: T;
+}
+
+export type ContractEventCallback<T = unknown> = (
+  event: ContractEvent<T>,
+) => void;
+
+/**
+ * Decodes a raw event (topic + XDR-shaped ScVal data) into a typed
+ * {@link ContractEvent}.
+ */
+export function decodeContractEvent<T = unknown>(raw: {
+  type: string;
+  ledger: number;
+  data: ScVal;
+}): ContractEvent<T> {
+  return {
+    type: raw.type,
+    ledger: raw.ledger,
+    data: fromScVal(raw.data) as T,
+  };
+}
+
+export type TransactionStatus = "SUCCESS" | "FAILED" | "NOT_FOUND" | "PENDING";
+
+export interface TransactionStatusResult {
+  status: TransactionStatus;
+  txHash: string;
+}
+
+/**
+ * Thrown by {@link SLACalculatorClient.waitForTransactionConfirmation} when
+ * a transaction doesn't reach a terminal status before the timeout elapses.
+ */
+export class TimeoutError extends Error {
+  constructor(txHash: string) {
+    super(`Timed out waiting for transaction ${txHash} to confirm`);
+    this.name = "TimeoutError";
   }
 }
