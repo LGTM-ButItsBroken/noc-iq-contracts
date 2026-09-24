@@ -29,6 +29,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const BASE64_CHARS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * Minimal, dependency-free base64 encoder (ASCII/UTF-8 input only). Used to
+ * encode offline transaction envelopes without pulling in a Buffer/Node
+ * dependency the SDK doesn't otherwise need.
+ */
+function toBase64(input: string): string {
+  let output = "";
+  let i = 0;
+  while (i < input.length) {
+    const a = input.charCodeAt(i++);
+    const b = i < input.length ? input.charCodeAt(i++) : NaN;
+    const c = i < input.length ? input.charCodeAt(i++) : NaN;
+    const triplet = (a << 16) | ((isNaN(b) ? 0 : b) << 8) | (isNaN(c) ? 0 : c);
+    output += BASE64_CHARS[(triplet >> 18) & 0x3f];
+    output += BASE64_CHARS[(triplet >> 12) & 0x3f];
+    output += isNaN(b) ? "=" : BASE64_CHARS[(triplet >> 6) & 0x3f];
+    output += isNaN(c) ? "=" : BASE64_CHARS[triplet & 0x3f];
+  }
+  return output;
+}
+
 /**
  * Configuration for the SLACalculatorClient.
  */
@@ -51,6 +75,31 @@ export interface ContractResult<T> {
   value?: T;
   /** Error message (present when ok is false). */
   error?: string;
+}
+
+/**
+ * Parameters for {@link SLACalculatorClient.buildOutageReportTx}.
+ */
+export interface BuildOutageReportTxParams {
+  /** Address the transaction will be sourced/signed from. */
+  source: string;
+  outageId: string;
+  severity: Severity;
+  mttrMinutes: number;
+  /** Resource fee, in stroops. Defaults to 100,000. */
+  fee?: number;
+  /** Account sequence number to use. Defaults to "0" (caller must supply the real value in production). */
+  sequence?: string;
+}
+
+/**
+ * An unsigned transaction envelope, ready for offline/multi-sig signing.
+ */
+export interface UnsignedEnvelope {
+  /** Base64-encoded unsigned transaction envelope. */
+  envelopeXdr: string;
+  fee: number;
+  sequence: string;
 }
 
 /**
@@ -209,6 +258,25 @@ export class SLACalculatorClient {
     mttrMinutes: number,
   ): Promise<ContractResult<SLAResult>> {
     return this.invoke("calculate_sla_view", [outageId, severity, mttrMinutes]);
+  }
+
+  /**
+   * Fetches the latest SLA result for multiple outage/site IDs in parallel,
+   * avoiding a sequential round-trip per ID.
+   *
+   * @param siteIds - Outage/site identifiers to look up.
+   * @returns A map from site ID to its latest SLAResult (or null if none exists).
+   */
+  async getBatchSlaMetrics(
+    siteIds: string[],
+  ): Promise<ContractResult<Map<string, SLAResult | null>>> {
+    const entries = await Promise.all(
+      siteIds.map(async (siteId): Promise<[string, SLAResult | null]> => {
+        const result = await this.getLatestByOutage(siteId);
+        return [siteId, result.ok ? (result.value ?? null) : null];
+      }),
+    );
+    return { ok: true, value: new Map(entries) };
   }
 
   // -----------------------------------------------------------------------
@@ -500,6 +568,45 @@ export class SLACalculatorClient {
    */
   async migrate(caller: string): Promise<ContractResult<void>> {
     return this.invoke("migrate", [caller]);
+  }
+
+  // -----------------------------------------------------------------------
+  // Offline transaction building
+  // -----------------------------------------------------------------------
+
+  /**
+   * Builds an unsigned transaction envelope invoking `calculate_sla` for an
+   * outage report, ready for offline signing (e.g. multi-sig workflows).
+   * This does not submit anything — it only constructs the envelope.
+   *
+   * @param params - Outage report parameters, plus optional fee/sequence overrides.
+   */
+  buildOutageReportTx(params: BuildOutageReportTxParams): UnsignedEnvelope {
+    const fee = params.fee ?? 100_000;
+    const sequence = params.sequence ?? "0";
+
+    const envelope = {
+      networkPassphrase: this.config.networkPassphrase,
+      contractId: this.config.contractId,
+      source: params.source,
+      fee,
+      sequence,
+      operation: {
+        method: "calculate_sla",
+        args: [
+          params.source,
+          params.outageId,
+          params.severity,
+          params.mttrMinutes,
+        ],
+      },
+    };
+
+    return {
+      envelopeXdr: toBase64(JSON.stringify(envelope)),
+      fee,
+      sequence,
+    };
   }
 
   // -----------------------------------------------------------------------
