@@ -5,13 +5,18 @@
  * Provides ergonomic wrappers for all public contract methods.
  */
 
-export { SLACalculatorClient } from "./client";
+export { SLACalculatorClient, TimeoutError, decodeContractEvent } from "./client";
 export type {
   ClientConfig,
   ContractResult,
-  BuildOutageReportTxParams,
-  UnsignedEnvelope,
+  PreflightResult,
+  ContractEvent,
+  ContractEventCallback,
+  TransactionStatus,
+  TransactionStatusResult,
 } from "./client";
+export { toScVal, fromScVal } from "./scval";
+export type { ScVal, ScValType } from "./scval";
 export {
   CANONICAL_SEVERITIES,
   MAX_HISTORY_SIZE,
