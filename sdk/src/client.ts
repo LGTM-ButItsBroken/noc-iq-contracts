@@ -621,7 +621,7 @@ export class SLACalculatorClient {
    * @param args - Positional arguments.
    * @returns Typed result wrapper.
    */
-  private async invoke<T>(
+  protected async invoke<T>(
     _method: string,
     args: unknown[],
   ): Promise<ContractResult<T>> {
