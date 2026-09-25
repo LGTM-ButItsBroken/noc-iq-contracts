@@ -239,14 +239,23 @@ pub struct SettlementPayout {
 // Functions
 // -----------------------------------------------------------------------
 
-/// Open a new dispute for an SLA calculation.
+/// Issue #715: formal SLA dispute filing protocol. Lets a customer open a
+/// dispute against an outage record, locking a bond and attaching initial
+/// evidence in a single call.
 ///
 /// # Arguments
 /// - `caller`: Address opening the dispute.
 /// - `dispute_id`: Unique identifier for this dispute.
-/// - `outage_id`: The outage ID being disputed.
+/// - `outage_id`: The outage ID being disputed — this dispute's existence
+///   in `Open` status is this module's record of the outage now being
+///   under dispute (this file has no cross-contract link to an outage
+///   record to flip a status field on directly; see the module doc).
 /// - `reason`: Explanation of why the calculation is disputed.
-/// - `bond_amount`: Bond posted by the filer (issue #722 / #720).
+/// - `bond_amount`: Bond posted by the filer, locked in this contract's
+///   accounting (issue #722 / #720 govern how it's later released/split).
+/// - `evidence_hash`: Initial off-chain evidence hash for the dispute.
+///   Pass `no_evidence_hash(env)` if none is available yet — more can be
+///   appended later via `add_dispute_evidence` (issue #719).
 ///
 /// # Events
 /// - `disp_op`: Emitted when dispute is opened.
@@ -261,6 +270,7 @@ pub fn open_dispute(
     outage_id: Symbol,
     reason: soroban_sdk::String,
     bond_amount: i128,
+    evidence_hash: BytesN<32>,
 ) -> Result<(), DisputeError> {
     let now = env.ledger().timestamp();
 
@@ -269,6 +279,11 @@ pub fn open_dispute(
     // Issue #723: reject new filings once the active-dispute cap is hit.
     if count_active_disputes(&disputes) >= MAX_ACTIVE_DISPUTES {
         return Err(DisputeError::MaxActiveDisputesReached);
+    }
+
+    let mut evidence_history = soroban_sdk::Vec::new(env);
+    if evidence_hash != no_evidence_hash(env) {
+        evidence_history.push_back(evidence_hash.clone());
     }
 
     let dispute = Dispute {
@@ -283,8 +298,8 @@ pub fn open_dispute(
         resolved_by: None,
         resolved_at: None,
         bond_amount,
-        evidence_hash: no_evidence_hash(env),
-        evidence_history: soroban_sdk::Vec::new(env),
+        evidence_hash,
+        evidence_history,
         arbitrator_votes: soroban_sdk::Vec::new(env),
         votes_detail: soroban_sdk::Vec::new(env),
         designated_arbitrators: soroban_sdk::Vec::new(env),
@@ -991,12 +1006,29 @@ mod tests {
         for i in 0..MAX_ACTIVE_DISPUTES {
             let id = Symbol::new(&env, &format!("d{}", i));
             let outage = Symbol::new(&env, "outage");
-            open_dispute(&env, &filer, id, outage, reason(&env), 1_000).unwrap();
+            open_dispute(
+                &env,
+                &filer,
+                id,
+                outage,
+                reason(&env),
+                1_000,
+                no_evidence_hash(&env),
+            )
+            .unwrap();
         }
 
         let one_too_many = Symbol::new(&env, "d_overflow");
         let outage = Symbol::new(&env, "outage");
-        let result = open_dispute(&env, &filer, one_too_many, outage, reason(&env), 1_000);
+        let result = open_dispute(
+            &env,
+            &filer,
+            one_too_many,
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        );
         assert_eq!(result, Err(DisputeError::MaxActiveDisputesReached));
     }
 
@@ -1008,7 +1040,16 @@ mod tests {
         for i in 0..MAX_ACTIVE_DISPUTES {
             let id = Symbol::new(&env, &format!("d{}", i));
             let outage = Symbol::new(&env, "outage");
-            open_dispute(&env, &filer, id, outage, reason(&env), 1_000).unwrap();
+            open_dispute(
+                &env,
+                &filer,
+                id,
+                outage,
+                reason(&env),
+                1_000,
+                no_evidence_hash(&env),
+            )
+            .unwrap();
         }
 
         let first_id = Symbol::new(&env, "d0");
@@ -1016,7 +1057,16 @@ mod tests {
 
         let new_id = Symbol::new(&env, "d_after_free");
         let outage = Symbol::new(&env, "outage");
-        assert!(open_dispute(&env, &filer, new_id, outage, reason(&env), 1_000).is_ok());
+        assert!(open_dispute(
+            &env,
+            &filer,
+            new_id,
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env)
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1029,7 +1079,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         // Split vote (1 uphold, 1 non-frivolous dismiss) so quorum auto-
         // finalization (issue #717) doesn't preempt this admin resolution.
@@ -1055,7 +1114,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
         cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
 
         let payout = resolve_dispute(&env, &admin, id, reason(&env), false).unwrap();
@@ -1074,7 +1142,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         resolve_dispute(&env, &admin, id.clone(), reason(&env), false).unwrap();
 
@@ -1092,7 +1169,16 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 2_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            2_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
         cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
 
         let details = get_dispute_details(&env, id).unwrap();
@@ -1111,7 +1197,16 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         env.ledger()
             .set_timestamp(1_000 + DEFAULT_ARBITRATION_WINDOW_SECS + 500);
@@ -1131,7 +1226,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         add_dispute_evidence(&env, &filer, id.clone(), evidence_hash(&env, 1)).unwrap();
         add_dispute_evidence(&env, &filer, id.clone(), evidence_hash(&env, 2)).unwrap();
@@ -1149,7 +1253,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let result = add_dispute_evidence(&env, &stranger, id, evidence_hash(&env, 1));
         assert_eq!(result, Err(DisputeError::NotDisputeFiler));
@@ -1165,7 +1278,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1);
@@ -1187,7 +1309,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1);
@@ -1210,7 +1341,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1.clone());
@@ -1257,7 +1397,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1.clone());
@@ -1291,7 +1440,16 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1.clone());
@@ -1321,7 +1479,16 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         env.ledger()
             .set_timestamp(1_000 + DEFAULT_ARBITRATION_WINDOW_SECS + 1);
@@ -1343,9 +1510,43 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            1_000,
+            no_evidence_hash(&env),
+        )
+        .unwrap();
 
         let result = auto_resolve_expired_dispute(&env, id);
         assert_eq!(result, Err(DisputeError::ArbitrationWindowNotExpired));
+    }
+
+    #[test]
+    fn test_filing_a_dispute_locks_bond_and_records_initial_evidence() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, filer) = setup(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(
+            &env,
+            &filer,
+            id.clone(),
+            outage,
+            reason(&env),
+            5_000,
+            evidence_hash(&env, 7),
+        )
+        .unwrap();
+
+        let details = get_dispute_details(&env, id).unwrap();
+        assert_eq!(details.status, DisputeStatus::Open);
+        assert_eq!(details.bond_amount, 5_000);
+        assert_eq!(details.evidence_hash, evidence_hash(&env, 7));
     }
 }
