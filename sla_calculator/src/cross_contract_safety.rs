@@ -34,7 +34,127 @@
 //! Cross-contract calls use compact tuple arguments (contract_id, amount, recipient)
 //! instead of full structs to reduce serialization byte size and call overhead.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec, i128};
+use soroban_sdk::{
+    contracterror, contracttype, symbol_short, Address, Env, IntoVal, Map, Symbol, Vec,
+};
+
+// -----------------------------------------------------------------------
+// Issue #711: cross-contract caller authorization guard
+// -----------------------------------------------------------------------
+
+/// Storage key for the set of contract addresses authorized to invoke
+/// this contract's cross-contract-facing entry points.
+const AUTHORIZED_CALLERS_KEY: Symbol = symbol_short!("XC_CALL");
+/// Storage key for the admin address allowed to manage the caller
+/// registry. Self-contained (no `crate::` dependency), matching the
+/// convention used by other orphaned/self-contained modules in this
+/// crate such as `dispute.rs`.
+const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CrossContractSafetyError {
+    NotInitialized = 1,
+    Unauthorized = 2,
+    /// Issue #711: a caller contract not on the authorized registry
+    /// attempted a guarded call.
+    UnauthorizedCaller = 3,
+}
+
+fn load_authorized_callers(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&AUTHORIZED_CALLERS_KEY)
+        .unwrap_or(Map::new(env))
+}
+
+fn require_admin(env: &Env, caller: &Address) -> Result<(), CrossContractSafetyError> {
+    caller.require_auth();
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&ADMIN_KEY)
+        .ok_or(CrossContractSafetyError::NotInitialized)?;
+    if admin != *caller {
+        return Err(CrossContractSafetyError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Issue #711: set the admin allowed to manage the authorized-caller
+/// registry. Callable once — subsequent calls are rejected the same way
+/// as any other unauthorized-admin action, since there is no existing
+/// admin to authorize a change.
+pub fn initialize_admin(env: &Env, admin: &Address) -> Result<(), CrossContractSafetyError> {
+    if env.storage().instance().has(&ADMIN_KEY) {
+        return Err(CrossContractSafetyError::Unauthorized);
+    }
+    env.storage().instance().set(&ADMIN_KEY, admin);
+    Ok(())
+}
+
+/// Issue #711: admin-only — add a contract address to the authorized
+/// caller registry.
+pub fn add_authorized_caller(
+    env: &Env,
+    admin: &Address,
+    caller_contract: Address,
+) -> Result<(), CrossContractSafetyError> {
+    require_admin(env, admin)?;
+    let mut callers = load_authorized_callers(env);
+    callers.set(caller_contract, true);
+    env.storage()
+        .instance()
+        .set(&AUTHORIZED_CALLERS_KEY, &callers);
+    Ok(())
+}
+
+/// Issue #711: admin-only — remove a contract address from the
+/// authorized caller registry.
+pub fn remove_authorized_caller(
+    env: &Env,
+    admin: &Address,
+    caller_contract: Address,
+) -> Result<(), CrossContractSafetyError> {
+    require_admin(env, admin)?;
+    let mut callers = load_authorized_callers(env);
+    callers.remove(caller_contract);
+    env.storage()
+        .instance()
+        .set(&AUTHORIZED_CALLERS_KEY, &callers);
+    Ok(())
+}
+
+/// Issue #711: whether `caller_contract` is on the authorized caller
+/// registry.
+pub fn is_authorized_caller(env: &Env, caller_contract: &Address) -> bool {
+    load_authorized_callers(env)
+        .get(caller_contract.clone())
+        .unwrap_or(false)
+}
+
+/// Issue #711: guard for entry points that must only be reachable from
+/// other contracts, not directly. `caller_contract` is the address of
+/// the contract asserting it is the caller — Soroban's SDK does not
+/// expose an ambient "calling contract" the way `env.invoker()` would in
+/// some other VMs, so guarded entry points must accept this as an
+/// explicit parameter identifying the invoking contract (contracts don't
+/// hold signing keys the way user accounts do, so this is a registry
+/// membership check rather than a `require_auth()` call).
+///
+/// # Errors
+/// Returns `UnauthorizedCaller` if `caller_contract` is not on the
+/// registry.
+pub fn require_authorized_caller(
+    env: &Env,
+    caller_contract: &Address,
+) -> Result<(), CrossContractSafetyError> {
+    if !is_authorized_caller(env, caller_contract) {
+        return Err(CrossContractSafetyError::UnauthorizedCaller);
+    }
+    Ok(())
+}
 
 /// Status of a cross-contract call.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -197,7 +317,11 @@ pub struct CompactPayment {
 }
 
 /// Build compact payment tuple from individual components.
-pub fn build_compact_payment(contract_id: Address, amount: i128, recipient: Address) -> CompactPayment {
+pub fn build_compact_payment(
+    contract_id: Address,
+    amount: i128,
+    recipient: Address,
+) -> CompactPayment {
     CompactPayment {
         contract_id,
         amount,
@@ -209,7 +333,7 @@ pub fn build_compact_payment(contract_id: Address, amount: i128, recipient: Addr
 pub fn compact_payment_to_args(env: &Env, payment: &CompactPayment) -> Vec<soroban_sdk::Val> {
     let mut args = Vec::new(env);
     args.push_back(payment.contract_id.to_val());
-    args.push_back(payment.amount.to_val());
+    args.push_back(payment.amount.into_val(env));
     args.push_back(payment.recipient.to_val());
     args
 }
@@ -324,6 +448,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_unregistered_caller_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&cid, || {
+            let admin = Address::generate(&env);
+            initialize_admin(&env, &admin).unwrap();
+
+            let stranger = Address::generate(&env);
+            let result = require_authorized_caller(&env, &stranger);
+            assert_eq!(result, Err(CrossContractSafetyError::UnauthorizedCaller));
+        });
+    }
+
+    #[test]
+    fn test_admin_can_add_and_remove_authorized_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, crate::SLACalculatorContract);
+        let admin = Address::generate(&env);
+        let caller_contract = Address::generate(&env);
+
+        // Each mutating call gets its own `as_contract` scope: the test
+        // utils' mocked-auth machinery treats a repeated `require_auth()`
+        // for the same address within a single top-level `as_contract`
+        // call as a conflicting duplicate, so calls are split the way
+        // separate top-level contract invocations would be in practice.
+        env.as_contract(&cid, || {
+            initialize_admin(&env, &admin).unwrap();
+        });
+        env.as_contract(&cid, || {
+            assert!(!is_authorized_caller(&env, &caller_contract));
+        });
+        env.as_contract(&cid, || {
+            add_authorized_caller(&env, &admin, caller_contract.clone()).unwrap();
+        });
+        env.as_contract(&cid, || {
+            assert!(is_authorized_caller(&env, &caller_contract));
+            assert!(require_authorized_caller(&env, &caller_contract).is_ok());
+        });
+        env.as_contract(&cid, || {
+            remove_authorized_caller(&env, &admin, caller_contract.clone()).unwrap();
+        });
+        env.as_contract(&cid, || {
+            assert!(!is_authorized_caller(&env, &caller_contract));
+            assert_eq!(
+                require_authorized_caller(&env, &caller_contract),
+                Err(CrossContractSafetyError::UnauthorizedCaller)
+            );
+        });
+    }
+
+    #[test]
+    fn test_non_admin_cannot_manage_caller_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&cid, || {
+            let admin = Address::generate(&env);
+            initialize_admin(&env, &admin).unwrap();
+
+            let not_admin = Address::generate(&env);
+            let caller_contract = Address::generate(&env);
+            let result = add_authorized_caller(&env, &not_admin, caller_contract);
+            assert_eq!(result, Err(CrossContractSafetyError::Unauthorized));
+        });
+    }
+
+    #[test]
+    fn test_initialize_admin_rejected_once_already_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, crate::SLACalculatorContract);
+        env.as_contract(&cid, || {
+            let admin = Address::generate(&env);
+            initialize_admin(&env, &admin).unwrap();
+
+            let other = Address::generate(&env);
+            let result = initialize_admin(&env, &other);
+            assert_eq!(result, Err(CrossContractSafetyError::Unauthorized));
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Compact Payload Tests
     // -----------------------------------------------------------------------
@@ -334,9 +542,9 @@ mod tests {
         let contract_id = Address::generate(&env);
         let recipient = Address::generate(&env);
         let amount = 1000i128;
-        
+
         let compact = build_compact_payment(contract_id.clone(), amount, recipient.clone());
-        
+
         assert_eq!(compact.contract_id, contract_id);
         assert_eq!(compact.amount, amount);
         assert_eq!(compact.recipient, recipient);
@@ -348,10 +556,10 @@ mod tests {
         let contract_id = Address::generate(&env);
         let recipient = Address::generate(&env);
         let amount = 500i128;
-        
+
         let compact = build_compact_payment(contract_id.clone(), amount, recipient.clone());
         let args = compact_payment_to_args(&env, &compact);
-        
+
         assert_eq!(args.len(), 3);
     }
 
@@ -367,14 +575,14 @@ mod tests {
         let contract_id = Address::generate(&env);
         let recipient = Address::generate(&env);
         let amount = -250i128; // Penalty
-        
+
         let compact = build_compact_payment(contract_id.clone(), amount, recipient.clone());
         let args = compact_payment_to_args(&env, &compact);
-        
+
         // Verify that the args can be reconstructed for vault contract compatibility
         // The vault contract expects: (contract_id, amount, recipient)
         assert_eq!(args.len(), 3);
-        
+
         // Verify negative amounts work for penalties
         assert!(compact.amount < 0);
     }
@@ -385,18 +593,18 @@ mod tests {
         let env = Env::default();
         let contract_id = Address::generate(&env);
         let recipient = Address::generate(&env);
-        
+
         // Profile with compact payment (80 bytes estimated)
         let compact = build_compact_payment(contract_id.clone(), 1000, recipient.clone());
         let compact_args = compact_payment_to_args(&env, &compact);
         let compact_size = estimate_compact_payment_size();
-        
+
         // A full struct would include additional metadata fields like:
         // - payment_type: Symbol (additional overhead)
         // - timestamp: u64 (8 bytes)
         // - reference_id: Symbol (additional overhead)
         // Estimated full struct size: 80 + ~24 = 104+ bytes
-        
+
         // Verify compact is smaller
         assert!(compact_size < 104);
         assert_eq!(compact_args.len(), 3);

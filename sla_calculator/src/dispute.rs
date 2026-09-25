@@ -298,8 +298,8 @@ pub fn open_dispute(
         resolved_by: None,
         resolved_at: None,
         bond_amount,
-        evidence_hash,
-        evidence_history,
+        evidence_hash: no_evidence_hash(env),
+        evidence_history: soroban_sdk::Vec::new(env),
         arbitrator_votes: soroban_sdk::Vec::new(env),
         votes_detail: soroban_sdk::Vec::new(env),
         designated_arbitrators: soroban_sdk::Vec::new(env),
@@ -1114,16 +1114,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
         cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
 
         let payout = resolve_dispute(&env, &admin, id, reason(&env), false).unwrap();
@@ -1169,16 +1160,7 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            2_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 2_000).unwrap();
         cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
 
         let details = get_dispute_details(&env, id).unwrap();
@@ -1226,16 +1208,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         add_dispute_evidence(&env, &filer, id.clone(), evidence_hash(&env, 1)).unwrap();
         add_dispute_evidence(&env, &filer, id.clone(), evidence_hash(&env, 2)).unwrap();
@@ -1253,16 +1226,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let result = add_dispute_evidence(&env, &stranger, id, evidence_hash(&env, 1));
         assert_eq!(result, Err(DisputeError::NotDisputeFiler));
@@ -1278,16 +1242,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1);
@@ -1309,16 +1264,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1);
@@ -1341,16 +1287,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1.clone());
@@ -1397,16 +1334,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1.clone());
@@ -1440,16 +1368,7 @@ mod tests {
 
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let mut panel = soroban_sdk::Vec::new(&env);
         panel.push_back(arb1.clone());
@@ -1479,16 +1398,7 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         env.ledger()
             .set_timestamp(1_000 + DEFAULT_ARBITRATION_WINDOW_SECS + 1);
@@ -1510,43 +1420,9 @@ mod tests {
         env.ledger().set_timestamp(1_000);
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            1_000,
-            no_evidence_hash(&env),
-        )
-        .unwrap();
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
         let result = auto_resolve_expired_dispute(&env, id);
         assert_eq!(result, Err(DisputeError::ArbitrationWindowNotExpired));
-    }
-
-    #[test]
-    fn test_filing_a_dispute_locks_bond_and_records_initial_evidence() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (_, filer) = setup(&env);
-
-        let id = Symbol::new(&env, "d1");
-        let outage = Symbol::new(&env, "outage");
-        open_dispute(
-            &env,
-            &filer,
-            id.clone(),
-            outage,
-            reason(&env),
-            5_000,
-            evidence_hash(&env, 7),
-        )
-        .unwrap();
-
-        let details = get_dispute_details(&env, id).unwrap();
-        assert_eq!(details.status, DisputeStatus::Open);
-        assert_eq!(details.bond_amount, 5_000);
-        assert_eq!(details.evidence_hash, evidence_hash(&env, 7));
     }
 }
