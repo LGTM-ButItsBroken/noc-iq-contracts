@@ -17,6 +17,9 @@ const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ARB_FEES_KEY: Symbol = symbol_short!("ARBFEE");
 /// Issue #720: settlement payout record per dispute.
 const PAYOUTS_KEY: Symbol = symbol_short!("PAYOUT");
+/// Issue #718: total value slashed from frivolous-dispute bonds, held for
+/// the arbitration pool reserve.
+const ARBITRATION_POOL_KEY: Symbol = symbol_short!("ARBPOOL");
 
 // -----------------------------------------------------------------------
 // Events
@@ -26,6 +29,12 @@ const EVENT_DISPUTE_ESCALATED: Symbol = symbol_short!("disp_es");
 const EVENT_DISPUTE_RESOLVED: Symbol = symbol_short!("disp_rv");
 const EVENT_ARBITRATOR_VOTED: Symbol = symbol_short!("disp_vt");
 const EVENT_SETTLEMENT_PAYOUT: Symbol = symbol_short!("disp_pay");
+/// Issue #719.
+const EVENT_EVIDENCE_ADDED: Symbol = symbol_short!("disp_ev");
+/// Issue #717: emitted when 2-of-3 quorum finalizes a dispute automatically.
+const EVENT_QUORUM_REACHED: Symbol = symbol_short!("disp_qr");
+/// Issue #716: emitted when the arbitration window expires unresolved.
+const EVENT_AUTO_RESOLVED: Symbol = symbol_short!("disp_ar");
 const EVENT_VERSION: Symbol = symbol_short!("v1");
 
 // -----------------------------------------------------------------------
@@ -41,11 +50,15 @@ pub const MAX_ACTIVE_DISPUTES: u32 = 50;
 const ARBITRATOR_FEE_BPS: i128 = 500;
 const BPS_DENOMINATOR: i128 = 10_000;
 
-/// Issue #721 / #716 (arbitration window timelock — tracked here as a
-/// field so this issue's getter can report time remaining; the actual
-/// timelock *enforcement* is a separate, not-yet-implemented concern):
-/// default window from filing until the arbitration deadline.
-const DEFAULT_ARBITRATION_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+/// Issue #716: window from filing until the arbitration deadline. After
+/// this elapses without a resolution, `auto_resolve_expired_dispute` lets
+/// anyone finalize the dispute in favor of the reporter.
+const DEFAULT_ARBITRATION_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Issue #717: size of the designated arbitrator panel and the quorum
+/// (majority) of votes required to auto-finalize a dispute.
+const ARBITRATOR_PANEL_SIZE: u32 = 3;
+const ARBITRATOR_QUORUM: u32 = 2;
 
 /// All-zero sentinel for `Dispute::evidence_hash` meaning "not set yet" —
 /// see the field's doc comment for why this isn't `Option<BytesN<32>>`.
@@ -68,6 +81,14 @@ pub enum DisputeError {
     MaxActiveDisputesReached = 5,
     /// Issue #722: vote cast against a dispute that is no longer active.
     DisputeNotActive = 6,
+    /// Issue #719: evidence submitted by someone other than the dispute's
+    /// original filer.
+    NotDisputeFiler = 7,
+    /// Issue #717: panel assignment that isn't exactly `ARBITRATOR_PANEL_SIZE`
+    /// addresses, or a vote cast by an address not on the assigned panel.
+    InvalidArbitratorPanel = 8,
+    /// Issue #716: the arbitration window has not yet elapsed.
+    ArbitrationWindowNotExpired = 9,
 }
 
 // -----------------------------------------------------------------------
@@ -105,6 +126,28 @@ pub enum EscalationLevel {
     L3Management,
 }
 
+/// Issue #717: an arbitrator's decision on a dispute.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VoteDecision {
+    /// The outage breach is valid — the dispute is upheld.
+    UpholdOutage,
+    /// The outage breach is invalid — the dispute is dismissed.
+    DismissOutage,
+}
+
+/// Issue #717 / #718: a single arbitrator's recorded vote, including the
+/// issue #718 "frivolous" tag used for bond-slashing eligibility.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorVote {
+    pub arbitrator: Address,
+    pub decision: VoteDecision,
+    /// Issue #718: arbitrator's assessment that the dispute itself was
+    /// filed in bad faith / without valid evidence.
+    pub frivolous: bool,
+}
+
 /// A dispute record.
 #[soroban_sdk::contracttype]
 #[derive(Clone)]
@@ -138,8 +181,21 @@ pub struct Dispute {
     /// doesn't derive `#[contracttype]` cleanly in this soroban-sdk
     /// version, hence the sentinel value instead of `None`.
     pub evidence_hash: BytesN<32>,
+    /// Issue #719: full history of evidence hashes submitted for this
+    /// dispute, most recent last. `evidence_hash` always mirrors the last
+    /// entry (or the all-zero sentinel when empty).
+    pub evidence_history: soroban_sdk::Vec<BytesN<32>>,
     /// Issue #722 / #721: arbitrators who have cast a vote on this dispute.
     pub arbitrator_votes: soroban_sdk::Vec<Address>,
+    /// Issue #717 / #718: detailed per-arbitrator decisions (upheld/
+    /// dismissed + frivolous tag), one per entry in `arbitrator_votes`.
+    pub votes_detail: soroban_sdk::Vec<ArbitratorVote>,
+    /// Issue #717: the exactly-`ARBITRATOR_PANEL_SIZE` addresses designated
+    /// to vote on this dispute. Empty until `assign_arbitrator_panel` is
+    /// called, in which case (for backward compatibility with disputes
+    /// filed before panel assignment existed) any arbitrator may still
+    /// vote via `cast_arbitrator_vote`.
+    pub designated_arbitrators: soroban_sdk::Vec<Address>,
     /// Issue #721 / #716: ledger timestamp after which the arbitration
     /// window closes.
     pub arbitration_window_deadline: u64,
@@ -228,7 +284,10 @@ pub fn open_dispute(
         resolved_at: None,
         bond_amount,
         evidence_hash: no_evidence_hash(env),
+        evidence_history: soroban_sdk::Vec::new(env),
         arbitrator_votes: soroban_sdk::Vec::new(env),
+        votes_detail: soroban_sdk::Vec::new(env),
+        designated_arbitrators: soroban_sdk::Vec::new(env),
         arbitration_window_deadline: now + DEFAULT_ARBITRATION_WINDOW_SECS,
     };
 
@@ -296,23 +355,126 @@ pub fn escalate_dispute(
     Ok(())
 }
 
-/// Issue #722: cast an arbitrator's vote on an active dispute.
+/// Issue #719: append an updated evidence hash to an active dispute,
+/// instead of requiring a whole new dispute instance for follow-up
+/// evidence.
+///
+/// # Arguments
+/// - `caller`: Must be the dispute's original filer.
+/// - `dispute_id`: The dispute to update.
+/// - `new_evidence_hash`: Hash of the newly-submitted off-chain evidence
+///   (e.g. an IPFS CID digest).
+///
+/// # Events
+/// - `disp_ev`: Emitted with the dispute ID and updated evidence count.
+///
+/// # Errors
+/// Returns `NotDisputeFiler` if `caller` did not open the dispute, or
+/// `DisputeNotActive` if it has already been resolved or dismissed.
+pub fn add_dispute_evidence(
+    env: &Env,
+    caller: &Address,
+    dispute_id: Symbol,
+    new_evidence_hash: BytesN<32>,
+) -> Result<(), DisputeError> {
+    caller.require_auth();
+
+    let mut disputes = load_disputes(env);
+    let mut dispute = disputes
+        .get(dispute_id.clone())
+        .ok_or(DisputeError::ConfigNotFound)?;
+
+    if dispute.opened_by != *caller {
+        return Err(DisputeError::NotDisputeFiler);
+    }
+    if !dispute.status.is_active() {
+        return Err(DisputeError::DisputeNotActive);
+    }
+
+    dispute
+        .evidence_history
+        .push_back(new_evidence_hash.clone());
+    dispute.evidence_hash = new_evidence_hash;
+
+    let history_len = dispute.evidence_history.len();
+    disputes.set(dispute_id.clone(), dispute);
+    env.storage().instance().set(&DISPUTES_KEY, &disputes);
+
+    env.events().publish(
+        (EVENT_EVIDENCE_ADDED, EVENT_VERSION, caller),
+        (dispute_id, history_len),
+    );
+
+    Ok(())
+}
+
+/// Issue #717: designate the 3-member arbitrator panel for a dispute.
+/// Admin only. Once assigned, only panel members can vote on this dispute.
+///
+/// # Errors
+/// Returns `InvalidArbitratorPanel` if `panel` does not contain exactly
+/// `ARBITRATOR_PANEL_SIZE` (3) addresses.
+pub fn assign_arbitrator_panel(
+    env: &Env,
+    caller: &Address,
+    dispute_id: Symbol,
+    panel: soroban_sdk::Vec<Address>,
+) -> Result<(), DisputeError> {
+    require_admin(env, caller)?;
+
+    if panel.len() != ARBITRATOR_PANEL_SIZE {
+        return Err(DisputeError::InvalidArbitratorPanel);
+    }
+
+    let mut disputes = load_disputes(env);
+    let mut dispute = disputes
+        .get(dispute_id.clone())
+        .ok_or(DisputeError::ConfigNotFound)?;
+
+    if !dispute.status.is_active() {
+        return Err(DisputeError::DisputeNotActive);
+    }
+
+    dispute.designated_arbitrators = panel;
+    disputes.set(dispute_id.clone(), dispute);
+    env.storage().instance().set(&DISPUTES_KEY, &disputes);
+
+    Ok(())
+}
+
+/// Issue #722 / #717 / #718: cast an arbitrator's vote on an active
+/// dispute.
 ///
 /// Any arbitrator who votes before the dispute is settled shares in the
-/// arbitrator fee reward on resolution. Voting twice is a no-op (the
-/// arbitrator is not double-counted).
+/// arbitrator fee reward on resolution (issue #722). Voting twice is a
+/// no-op for the address (not double-counted), it does not update a
+/// previously-recorded decision.
+///
+/// If a 3-member panel has been assigned via `assign_arbitrator_panel`,
+/// only panel members may vote; otherwise any address may (matching the
+/// original, pre-panel behavior).
+///
+/// Once `ARBITRATOR_QUORUM` (2 of 3) votes agree on the same
+/// `VoteDecision`, the dispute is automatically finalized (issue #717) —
+/// see `try_tally_quorum` for the upheld/slashing rules (issue #718) this
+/// applies.
 ///
 /// # Events
 /// - `disp_vt`: Emitted when an arbitrator casts a vote.
+/// - `disp_qr`, `disp_rv`, `disp_pay`: Emitted (via `settle_dispute`) if
+///   this vote reaches quorum and auto-finalizes the dispute.
 ///
 /// # Errors
 /// Returns `DisputeNotActive` if the dispute has already been resolved or
-/// dismissed.
+/// dismissed, or `InvalidArbitratorPanel` if a panel is assigned and
+/// `arbitrator` is not on it.
 pub fn cast_arbitrator_vote(
     env: &Env,
     arbitrator: &Address,
     dispute_id: Symbol,
-) -> Result<(), DisputeError> {
+    decision: VoteDecision,
+    frivolous: bool,
+) -> Result<Option<SettlementPayout>, DisputeError> {
     arbitrator.require_auth();
 
     let mut disputes = load_disputes(env);
@@ -324,19 +486,106 @@ pub fn cast_arbitrator_vote(
         return Err(DisputeError::DisputeNotActive);
     }
 
+    if !dispute.designated_arbitrators.is_empty()
+        && !dispute.designated_arbitrators.contains(arbitrator)
+    {
+        return Err(DisputeError::InvalidArbitratorPanel);
+    }
+
     if !dispute.arbitrator_votes.contains(arbitrator) {
         dispute.arbitrator_votes.push_back(arbitrator.clone());
+        dispute.votes_detail.push_back(ArbitratorVote {
+            arbitrator: arbitrator.clone(),
+            decision,
+            frivolous,
+        });
+    }
+
+    env.events().publish(
+        (EVENT_ARBITRATOR_VOTED, EVENT_VERSION, arbitrator.clone()),
+        dispute_id.clone(),
+    );
+
+    if let Some((upheld, slash_bond, resolution)) = try_tally_quorum(env, &dispute) {
+        env.events()
+            .publish((EVENT_QUORUM_REACHED, EVENT_VERSION), dispute_id.clone());
+        let payout = settle_dispute(
+            env,
+            disputes,
+            dispute_id,
+            dispute,
+            arbitrator.clone(),
+            resolution,
+            upheld,
+            slash_bond,
+        );
+        return Ok(Some(payout));
     }
 
     disputes.set(dispute_id.clone(), dispute);
     env.storage().instance().set(&DISPUTES_KEY, &disputes);
 
-    env.events().publish(
-        (EVENT_ARBITRATOR_VOTED, EVENT_VERSION, arbitrator.clone()),
-        dispute_id,
-    );
+    Ok(None)
+}
 
-    Ok(())
+/// Issue #717 / #718: tally `dispute.votes_detail` and, if quorum has been
+/// reached, return `(upheld, slash_bond, resolution_note)` for
+/// `settle_dispute`.
+///
+/// - `>= ARBITRATOR_QUORUM` `UpholdOutage` votes: dispute upheld.
+/// - `>= ARBITRATOR_QUORUM` `DismissOutage` votes: dispute dismissed; if
+///   *every* panel seat (`ARBITRATOR_PANEL_SIZE`) voted `DismissOutage`
+///   with `frivolous: true`, the bond is slashed 100% to the arbitration
+///   pool instead of refunded (issue #718).
+fn try_tally_quorum(env: &Env, dispute: &Dispute) -> Option<(bool, bool, soroban_sdk::String)> {
+    let mut uphold_count: u32 = 0;
+    let mut dismiss_count: u32 = 0;
+    let mut all_frivolous_dismiss = true;
+
+    for vote in dispute.votes_detail.iter() {
+        match vote.decision {
+            VoteDecision::UpholdOutage => {
+                uphold_count += 1;
+                all_frivolous_dismiss = false;
+            }
+            VoteDecision::DismissOutage => {
+                dismiss_count += 1;
+                if !vote.frivolous {
+                    all_frivolous_dismiss = false;
+                }
+            }
+        }
+    }
+
+    if uphold_count >= ARBITRATOR_QUORUM {
+        return Some((
+            true,
+            false,
+            soroban_sdk::String::from_str(
+                env,
+                "Auto-resolved: arbitrator quorum upheld the outage breach",
+            ),
+        ));
+    }
+
+    if dismiss_count >= ARBITRATOR_QUORUM {
+        let total_votes = uphold_count + dismiss_count;
+        let slash = total_votes == ARBITRATOR_PANEL_SIZE && all_frivolous_dismiss;
+        let resolution = if slash {
+            soroban_sdk::String::from_str(
+                env,
+                "Auto-resolved: unanimous frivolous dismissal, bond slashed to arbitration pool",
+            )
+        } else {
+            soroban_sdk::String::from_str(
+                env,
+                "Auto-resolved: arbitrator quorum dismissed the outage breach",
+            )
+        };
+        return Some((false, slash, resolution));
+    }
+
+    None
 }
 
 /// Resolve a dispute.
@@ -374,9 +623,9 @@ pub fn resolve_dispute(
 ) -> Result<SettlementPayout, DisputeError> {
     require_admin(env, caller)?;
 
-    let mut disputes = load_disputes(env);
+    let disputes = load_disputes(env);
 
-    let mut dispute = disputes
+    let dispute = disputes
         .get(dispute_id.clone())
         .ok_or(DisputeError::ConfigNotFound)?;
 
@@ -385,25 +634,125 @@ pub fn resolve_dispute(
         return Err(DisputeError::InvalidTransition);
     }
 
+    Ok(settle_dispute(
+        env,
+        disputes,
+        dispute_id,
+        dispute,
+        caller.clone(),
+        resolution,
+        upheld,
+        false,
+    ))
+}
+
+/// Issue #716: permissionlessly resolve a dispute in favor of the filer
+/// once its arbitration window has elapsed without a manual or
+/// quorum-driven resolution. Anyone may call this — it exists so a filer
+/// is never stuck waiting on an admin or arbitrator panel that never
+/// acts.
+///
+/// # Events
+/// - `disp_ar`: Emitted when a dispute is auto-resolved this way.
+/// - `disp_rv`, `disp_pay`: Emitted (via `settle_dispute`) as with any
+///   other resolution.
+///
+/// # Errors
+/// Returns `DisputeNotActive` if the dispute was already resolved or
+/// dismissed, or `ArbitrationWindowNotExpired` if `arbitration_window_deadline`
+/// has not yet passed.
+pub fn auto_resolve_expired_dispute(
+    env: &Env,
+    dispute_id: Symbol,
+) -> Result<SettlementPayout, DisputeError> {
+    let disputes = load_disputes(env);
+
+    let dispute = disputes
+        .get(dispute_id.clone())
+        .ok_or(DisputeError::ConfigNotFound)?;
+
+    if !dispute.status.is_active() {
+        return Err(DisputeError::DisputeNotActive);
+    }
+
+    if env.ledger().timestamp() <= dispute.arbitration_window_deadline {
+        return Err(DisputeError::ArbitrationWindowNotExpired);
+    }
+
+    let resolved_by = dispute.opened_by.clone();
+    let resolution = soroban_sdk::String::from_str(
+        env,
+        "Auto-resolved: arbitration window expired, defaulted in favor of filer",
+    );
+
+    env.events()
+        .publish((EVENT_AUTO_RESOLVED, EVENT_VERSION), dispute_id.clone());
+
+    Ok(settle_dispute(
+        env,
+        disputes,
+        dispute_id,
+        dispute,
+        resolved_by,
+        resolution,
+        true,
+        false,
+    ))
+}
+
+/// Shared finalization path for `resolve_dispute`, `cast_arbitrator_vote`
+/// (quorum auto-finalization, issue #717) and
+/// `auto_resolve_expired_dispute` (issue #716).
+///
+/// Marks `dispute` resolved, computes and records the `SettlementPayout`,
+/// and persists everything to storage.
+///
+/// - `slash_bond` (issue #718): when `true`, 100% of the bond is
+///   transferred to the `ARBITRATION_POOL_KEY` reserve instead of being
+///   split between the customer and voting arbitrators — used for the
+///   unanimous frivolous-dismissal case.
+/// - Otherwise, when `upheld`, the arbitrator fee (issue #722) is
+///   deducted from the bond and split evenly among voting arbitrators,
+///   with the remainder refunded to the customer; when not upheld, the
+///   full bond is recorded as returned to the customer.
+fn settle_dispute(
+    env: &Env,
+    mut disputes: soroban_sdk::Map<Symbol, Dispute>,
+    dispute_id: Symbol,
+    mut dispute: Dispute,
+    resolved_by: Address,
+    resolution: soroban_sdk::String,
+    upheld: bool,
+    slash_bond: bool,
+) -> SettlementPayout {
     dispute.status = DisputeStatus::Resolved;
     dispute.resolution = Some(resolution);
-    dispute.resolved_by = Some(caller.clone());
+    dispute.resolved_by = Some(resolved_by.clone());
     dispute.resolved_at = Some(env.ledger().timestamp());
 
-    // Issue #722 / #720: compute the settlement payout before votes are
-    // locked in by the status change above.
     let voter_count = dispute.arbitrator_votes.len() as i128;
-    let arbitrator_fee_total = if upheld && voter_count > 0 {
-        dispute.bond_amount * ARBITRATOR_FEE_BPS / BPS_DENOMINATOR
+
+    let (customer_payout, arbitrator_fee_total, per_arbitrator_share, pool_amount) = if slash_bond {
+        (0, 0, 0, dispute.bond_amount)
     } else {
-        0
+        let arbitrator_fee_total = if upheld && voter_count > 0 {
+            dispute.bond_amount * ARBITRATOR_FEE_BPS / BPS_DENOMINATOR
+        } else {
+            0
+        };
+        let per_arbitrator_share = if voter_count > 0 {
+            arbitrator_fee_total / voter_count
+        } else {
+            0
+        };
+        let customer_payout = dispute.bond_amount - arbitrator_fee_total;
+        (
+            customer_payout,
+            arbitrator_fee_total,
+            per_arbitrator_share,
+            0,
+        )
     };
-    let per_arbitrator_share = if voter_count > 0 {
-        arbitrator_fee_total / voter_count
-    } else {
-        0
-    };
-    let customer_payout = dispute.bond_amount - arbitrator_fee_total;
 
     let payout = SettlementPayout {
         dispute_id: dispute_id.clone(),
@@ -422,6 +771,17 @@ pub fn resolve_dispute(
         env.storage().instance().set(&ARB_FEES_KEY, &arb_fees);
     }
 
+    if pool_amount > 0 {
+        let current_pool: i128 = env
+            .storage()
+            .instance()
+            .get(&ARBITRATION_POOL_KEY)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&ARBITRATION_POOL_KEY, &(current_pool + pool_amount));
+    }
+
     let mut payouts = load_payouts(env);
     payouts.set(dispute_id.clone(), payout.clone());
     env.storage().instance().set(&PAYOUTS_KEY, &payouts);
@@ -430,13 +790,22 @@ pub fn resolve_dispute(
     env.storage().instance().set(&DISPUTES_KEY, &disputes);
 
     env.events().publish(
-        (EVENT_DISPUTE_RESOLVED, EVENT_VERSION, caller),
+        (EVENT_DISPUTE_RESOLVED, EVENT_VERSION, resolved_by),
         (dispute_id.clone(), symbol_short!("resolve")),
     );
     env.events()
         .publish((EVENT_SETTLEMENT_PAYOUT, EVENT_VERSION), payout.clone());
 
-    Ok(payout)
+    payout
+}
+
+/// Issue #718: get the current balance of the arbitration pool reserve
+/// (funds slashed from bonds on unanimous frivolous dismissals).
+pub fn get_arbitration_pool_balance(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&ARBITRATION_POOL_KEY)
+        .unwrap_or(0)
 }
 
 /// Dismiss a dispute (admin only).
@@ -662,8 +1031,10 @@ mod tests {
         let outage = Symbol::new(&env, "outage");
         open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
 
-        cast_arbitrator_vote(&env, &arb1, id.clone()).unwrap();
-        cast_arbitrator_vote(&env, &arb2, id.clone()).unwrap();
+        // Split vote (1 uphold, 1 non-frivolous dismiss) so quorum auto-
+        // finalization (issue #717) doesn't preempt this admin resolution.
+        cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
+        cast_arbitrator_vote(&env, &arb2, id.clone(), VoteDecision::DismissOutage, false).unwrap();
 
         let payout = resolve_dispute(&env, &admin, id, reason(&env), true).unwrap();
 
@@ -685,7 +1056,7 @@ mod tests {
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
         open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
-        cast_arbitrator_vote(&env, &arb1, id.clone()).unwrap();
+        cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
 
         let payout = resolve_dispute(&env, &admin, id, reason(&env), false).unwrap();
 
@@ -707,7 +1078,7 @@ mod tests {
 
         resolve_dispute(&env, &admin, id.clone(), reason(&env), false).unwrap();
 
-        let result = cast_arbitrator_vote(&env, &arb1, id);
+        let result = cast_arbitrator_vote(&env, &arb1, id, VoteDecision::UpholdOutage, false);
         assert_eq!(result, Err(DisputeError::DisputeNotActive));
     }
 
@@ -722,7 +1093,7 @@ mod tests {
         let id = Symbol::new(&env, "d1");
         let outage = Symbol::new(&env, "outage");
         open_dispute(&env, &filer, id.clone(), outage, reason(&env), 2_000).unwrap();
-        cast_arbitrator_vote(&env, &arb1, id.clone()).unwrap();
+        cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false).unwrap();
 
         let details = get_dispute_details(&env, id).unwrap();
         assert_eq!(details.status, DisputeStatus::Open);
@@ -746,5 +1117,235 @@ mod tests {
             .set_timestamp(1_000 + DEFAULT_ARBITRATION_WINDOW_SECS + 500);
         let details = get_dispute_details(&env, id).unwrap();
         assert_eq!(details.time_remaining_secs, 0);
+    }
+
+    fn evidence_hash(env: &Env, seed: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[seed; 32])
+    }
+
+    #[test]
+    fn test_add_dispute_evidence_appends_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, filer) = setup(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        add_dispute_evidence(&env, &filer, id.clone(), evidence_hash(&env, 1)).unwrap();
+        add_dispute_evidence(&env, &filer, id.clone(), evidence_hash(&env, 2)).unwrap();
+
+        let details = get_dispute_details(&env, id).unwrap();
+        assert_eq!(details.evidence_hash, evidence_hash(&env, 2));
+    }
+
+    #[test]
+    fn test_add_dispute_evidence_rejects_non_filer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, filer) = setup(&env);
+        let stranger = Address::generate(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let result = add_dispute_evidence(&env, &stranger, id, evidence_hash(&env, 1));
+        assert_eq!(result, Err(DisputeError::NotDisputeFiler));
+    }
+
+    #[test]
+    fn test_assign_arbitrator_panel_requires_exact_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, filer) = setup(&env);
+        let arb1 = Address::generate(&env);
+        let arb2 = Address::generate(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let mut panel = soroban_sdk::Vec::new(&env);
+        panel.push_back(arb1);
+        panel.push_back(arb2);
+
+        let result = assign_arbitrator_panel(&env, &admin, id, panel);
+        assert_eq!(result, Err(DisputeError::InvalidArbitratorPanel));
+    }
+
+    #[test]
+    fn test_cast_vote_rejected_for_non_panel_member() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, filer) = setup(&env);
+        let arb1 = Address::generate(&env);
+        let arb2 = Address::generate(&env);
+        let arb3 = Address::generate(&env);
+        let outsider = Address::generate(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let mut panel = soroban_sdk::Vec::new(&env);
+        panel.push_back(arb1);
+        panel.push_back(arb2);
+        panel.push_back(arb3);
+        assign_arbitrator_panel(&env, &admin, id.clone(), panel).unwrap();
+
+        let result = cast_arbitrator_vote(&env, &outsider, id, VoteDecision::UpholdOutage, false);
+        assert_eq!(result, Err(DisputeError::InvalidArbitratorPanel));
+    }
+
+    #[test]
+    fn test_quorum_uphold_auto_finalizes_and_pays_arbitrators() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, filer) = setup(&env);
+        let arb1 = Address::generate(&env);
+        let arb2 = Address::generate(&env);
+        let arb3 = Address::generate(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let mut panel = soroban_sdk::Vec::new(&env);
+        panel.push_back(arb1.clone());
+        panel.push_back(arb2.clone());
+        panel.push_back(arb3.clone());
+        assign_arbitrator_panel(&env, &admin, id.clone(), panel).unwrap();
+
+        let result =
+            cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::UpholdOutage, false)
+                .unwrap();
+        assert!(result.is_none());
+
+        // Second matching vote reaches 2-of-3 quorum and auto-finalizes.
+        let result =
+            cast_arbitrator_vote(&env, &arb2, id.clone(), VoteDecision::UpholdOutage, false)
+                .unwrap();
+        let payout = result.expect("quorum should auto-finalize the dispute");
+        assert!(payout.upheld);
+        assert_eq!(payout.arbitrator_fee_total, 50);
+        assert_eq!(payout.customer_payout, 950);
+
+        let details = get_dispute_details(&env, id).unwrap();
+        assert_eq!(details.status, DisputeStatus::Resolved);
+
+        // Third arbitrator's vote is now rejected since the dispute is settled.
+        let late_vote = cast_arbitrator_vote(
+            &env,
+            &arb3,
+            Symbol::new(&env, "d1"),
+            VoteDecision::UpholdOutage,
+            false,
+        );
+        assert_eq!(late_vote, Err(DisputeError::DisputeNotActive));
+    }
+
+    #[test]
+    fn test_quorum_unanimous_frivolous_dismissal_slashes_bond() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, filer) = setup(&env);
+        let arb1 = Address::generate(&env);
+        let arb2 = Address::generate(&env);
+        let arb3 = Address::generate(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let mut panel = soroban_sdk::Vec::new(&env);
+        panel.push_back(arb1.clone());
+        panel.push_back(arb2.clone());
+        panel.push_back(arb3.clone());
+        assign_arbitrator_panel(&env, &admin, id.clone(), panel).unwrap();
+
+        let pool_before = get_arbitration_pool_balance(&env);
+
+        cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::DismissOutage, true).unwrap();
+        cast_arbitrator_vote(&env, &arb2, id.clone(), VoteDecision::DismissOutage, true).unwrap();
+        let payout =
+            cast_arbitrator_vote(&env, &arb3, id.clone(), VoteDecision::DismissOutage, true)
+                .unwrap()
+                .expect("unanimous frivolous dismissal should auto-finalize");
+
+        assert!(!payout.upheld);
+        assert_eq!(payout.customer_payout, 0);
+        assert_eq!(payout.arbitrator_fee_total, 0);
+        assert_eq!(get_arbitration_pool_balance(&env), pool_before + 1_000);
+    }
+
+    #[test]
+    fn test_quorum_dismissal_not_unanimous_frivolous_refunds_customer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, filer) = setup(&env);
+        let arb1 = Address::generate(&env);
+        let arb2 = Address::generate(&env);
+        let arb3 = Address::generate(&env);
+
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let mut panel = soroban_sdk::Vec::new(&env);
+        panel.push_back(arb1.clone());
+        panel.push_back(arb2.clone());
+        panel.push_back(arb3.clone());
+        assign_arbitrator_panel(&env, &admin, id.clone(), panel).unwrap();
+
+        // Not unanimous frivolous: arb2 dismisses without the frivolous tag.
+        let pool_before = get_arbitration_pool_balance(&env);
+        cast_arbitrator_vote(&env, &arb1, id.clone(), VoteDecision::DismissOutage, true).unwrap();
+        let payout =
+            cast_arbitrator_vote(&env, &arb2, id.clone(), VoteDecision::DismissOutage, false)
+                .unwrap()
+                .expect("quorum should still auto-finalize");
+
+        assert!(!payout.upheld);
+        assert_eq!(payout.customer_payout, 1_000);
+        assert_eq!(get_arbitration_pool_balance(&env), pool_before);
+    }
+
+    #[test]
+    fn test_auto_resolve_expired_dispute_favors_filer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, filer) = setup(&env);
+
+        env.ledger().set_timestamp(1_000);
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        env.ledger()
+            .set_timestamp(1_000 + DEFAULT_ARBITRATION_WINDOW_SECS + 1);
+
+        let payout = auto_resolve_expired_dispute(&env, id.clone()).unwrap();
+        assert!(payout.upheld);
+        assert_eq!(payout.customer_payout, 1_000);
+
+        let details = get_dispute_details(&env, id).unwrap();
+        assert_eq!(details.status, DisputeStatus::Resolved);
+    }
+
+    #[test]
+    fn test_auto_resolve_expired_dispute_rejects_before_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, filer) = setup(&env);
+
+        env.ledger().set_timestamp(1_000);
+        let id = Symbol::new(&env, "d1");
+        let outage = Symbol::new(&env, "outage");
+        open_dispute(&env, &filer, id.clone(), outage, reason(&env), 1_000).unwrap();
+
+        let result = auto_resolve_expired_dispute(&env, id);
+        assert_eq!(result, Err(DisputeError::ArbitrationWindowNotExpired));
     }
 }
